@@ -144,6 +144,36 @@ async function registerCompanionSkill(ctx: Opencode2Context, harness: string): P
 }
 
 /**
+ * Is this session a SUBAGENT's, rather than one the user is actually working in?
+ *
+ * A subagent session is a child of a conversation we already track, so both halves of the
+ * pipeline should leave it alone: injecting into it would pay for a second recall per
+ * delegation, and retaining it would file a fragment of a session the parent already stores
+ * in full. The dsh adapter makes the same call from its own host's `origin === "subagent"`
+ * marker (src/dsh.ts); opencode2 has no such marker, but it does record parentage, and a
+ * subagent session is exactly a session with a `parentID`.
+ *
+ * `fork` is deliberately NOT treated as subagent: a fork is a continuation the user chose to
+ * branch, and its conversation is as much theirs as the original's. Only `parentID` counts.
+ *
+ * Fails OPEN (retains) if the lookup throws. A probe that cannot answer must not be able to
+ * silently stop memory working — the failure mode we can see is better than the one we cannot.
+ */
+async function isSubagentSession(
+  ctx: Opencode2Context,
+  sessionID: string,
+  harness: string
+): Promise<boolean> {
+  try {
+    const info = await ctx.session.get({ sessionID: sessionID as never });
+    return info?.parentID != null;
+  } catch (e) {
+    diag(harness, "subagent_probe_failed", { session: sessionID, error: describeError(e) });
+    return false;
+  }
+}
+
+/**
  * Wire a RuntimeCore onto one opencode2 plugin context and return the teardown.
  *
  * Split out of `createOpencode2PluginEntry` so the hook wiring can be exercised against a fake
@@ -181,7 +211,14 @@ export async function wireOpencode2Runtime(
   // repeats it byte for byte. It used to be pushed into the system prompt from the `context` hook,
   // which made the system prompt change between turns and broke the provider's prefix cache
   // (#5914).
+  // Subagent sessions are dropped here, before they are ever admitted — the single gate covers
+  // both halves, because a session that never reaches `onPrompt` also never gets an injection
+  // built for it, and never joins `ownSessions` for the event loop below to retain.
   await ctx.session.hook("prompt", async (input) => {
+    if (await isSubagentSession(ctx, input.sessionID, harness)) {
+      diag(harness, "subagent_session_skipped", { session: input.sessionID });
+      return;
+    }
     ownSessions.add(input.sessionID);
     await core.onPrompt(input.sessionID, input.prompt?.text ?? "");
     const inj = core.getInjection(input.sessionID);
