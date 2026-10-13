@@ -26,7 +26,7 @@ type ToolDraft = { add(tool: Record<string, unknown>): void };
  * ids the prompt hook admitted, so a test that cannot say "these hooks ran, THEN this event
  * arrived" would be asserting on a race rather than on the guard.
  */
-function fakeContext() {
+function fakeContext(opts: { parentOf?: (id: string) => string | undefined; getThrows?: boolean } = {}) {
   const hooks: Record<string, unknown> = {};
   const tools: Record<string, any>[] = [];
   const skills: Record<string, any>[] = [];
@@ -58,6 +58,11 @@ function fakeContext() {
         hook: async (name: string, cb: unknown) => {
           hooks[name] = cb;
           return { dispose: async () => {} };
+        },
+        // The parentage probe: `parentID` set means a subagent session (see isSubagentSession).
+        get: async ({ sessionID }: { sessionID: string }) => {
+          if (opts.getThrows) throw new Error("session lookup unavailable");
+          return { id: sessionID, parentID: opts.parentOf?.(sessionID) };
         },
         context: async ({ sessionID }: { sessionID: string }) => {
           contextCalls.push(sessionID);
@@ -213,6 +218,52 @@ describe("opencode2 adapter", () => {
       { type: "session.idle", data: {} } // no session id: skipped, must not throw
     );
     expect(core.onSessionIdle.mock.calls).toEqual([["ses_run"], ["ses_tui"]]);
+  });
+
+  it("skips a subagent session entirely — no recall, no write-back", async () => {
+    // A subagent session is a child of a conversation we already track. Injecting into it would pay
+    // for a second recall per delegation, and retaining it would file a fragment of a session the
+    // parent stores in full — the same rule the dsh adapter applies from its own host's marker.
+    const fake = fakeContext({ parentOf: (id) => (id === "ses_child" ? "ses_parent" : undefined) });
+    const core = fakeCore();
+    await wireOpencode2Runtime(core, fake.ctx);
+    await fake.prompt()({ sessionID: "ses_child", prompt: { text: "subagent work" } });
+    // Never admitted, so the idle loop must ignore it even though the event does arrive.
+    await fake.emit({ type: "session.idle", data: { sessionID: "ses_child" } });
+    expect(core.onPrompt).not.toHaveBeenCalled();
+    expect(core.onSessionIdle).not.toHaveBeenCalled();
+  });
+
+  it("still recalls and writes back a primary session alongside a subagent one", async () => {
+    const fake = fakeContext({ parentOf: (id) => (id === "ses_child" ? "ses_parent" : undefined) });
+    const core = fakeCore();
+    await wireOpencode2Runtime(core, fake.ctx);
+    await fake.prompt()({ sessionID: "ses_child", prompt: { text: "subagent work" } });
+    await fake.prompt()({ sessionID: "ses_main", prompt: { text: "user work" } });
+    await fake.emit({ type: "session.idle", data: { sessionID: "ses_child" } });
+    await fake.emit({ type: "session.idle", data: { sessionID: "ses_main" } });
+    expect(core.onPrompt.mock.calls).toEqual([["ses_main", "user work"]]);
+    expect(core.onSessionIdle.mock.calls).toEqual([["ses_main"]]);
+  });
+
+  it("treats a fork as a primary session, not a subagent one", async () => {
+    // A fork is a continuation the user chose to branch, so its conversation is as much theirs as
+    // the original's. Only `parentID` marks a subagent, and a fork carries none.
+    const fake = fakeContext();
+    const core = fakeCore();
+    await wireOpencode2Runtime(core, fake.ctx);
+    await fake.prompt()({ sessionID: "ses_fork", prompt: { text: "branched work" } });
+    expect(core.onPrompt).toHaveBeenCalledWith("ses_fork", "branched work");
+  });
+
+  it("fails OPEN when the parentage probe throws", async () => {
+    // A probe that cannot answer must not be able to silently stop memory working. A visible loss
+    // of recall is diagnosable; one that leaves no trace is not.
+    const fake = fakeContext({ getThrows: true });
+    const core = fakeCore();
+    await wireOpencode2Runtime(core, fake.ctx);
+    await fake.prompt()({ sessionID: "ses_1", prompt: { text: "still recalls" } });
+    expect(core.onPrompt).toHaveBeenCalledWith("ses_1", "still recalls");
   });
 
   it("never writes back a session another project's plugin instance owns", async () => {
