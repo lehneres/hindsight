@@ -54,7 +54,7 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
+      "default": "./index.js"
     },
     "./server": "./index.js",
     "./dsh": "./dist/dsh.js",
